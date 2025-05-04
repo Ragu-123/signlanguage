@@ -240,9 +240,7 @@ class TrainManager:
         if self.use_cuda:
             self.model.cuda()
 
-    # Train and validate function
-    def train_and_validate(self, train_data: Dataset, valid_data: Dataset) \
-            -> None:
+    def train_and_validate(self, train_data: Dataset, valid_data: Dataset) -> None:
         # Make training iterator
         train_iter = make_data_iter(train_data,
                                     batch_size=self.batch_size,
@@ -252,12 +250,31 @@ class TrainManager:
         val_step = 0
         if self.gaussian_noise:
             all_epoch_noise = []
+        
+        # Define minimum learning rate threshold
+        MIN_LR = 0.000240
+
+        # Add cyclic learning rate parameters
+        self.cyclic_scheduler = torch.optim.lr_scheduler.CyclicLR(
+            self.optimizer,
+            base_lr=0.001,  # Minimum LR
+            max_lr=0.01,    # Maximum LR
+            step_size_up=2000,  # Steps per half cycle
+            mode='triangular2',  # Learning rate decreases by half after each cycle
+            cycle_momentum=False
+        )
+
         # Loop through epochs
         for epoch_no in range(self.epochs):
             self.logger.info("EPOCH %d", epoch_no + 1)
 
             if self.scheduler is not None and self.scheduler_step_at == "epoch":
-                self.scheduler.step(epoch=epoch_no)
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if current_lr > MIN_LR:
+                    self.scheduler.step(epoch=epoch_no)
+                else:
+                    self.logger.info(f"Learning rate {current_lr} below threshold {MIN_LR}, using cyclic schedule")
+                    self.cyclic_scheduler.step()
 
             self.model.train()
 
@@ -302,7 +319,12 @@ class TrainManager:
                 epoch_loss += batch_loss.detach().cpu().numpy()
 
                 if self.scheduler is not None and self.scheduler_step_at == "step" and update:
-                    self.scheduler.step()
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    if current_lr > MIN_LR:
+                        self.scheduler.step()
+                    else:
+                        self.logger.info(f"Learning rate {current_lr} below threshold {MIN_LR}, using cyclic schedule")
+                        self.cyclic_scheduler.step()
 
                 # log learning progress
                 if self.steps % self.logging_freq == 0 and update:
@@ -320,7 +342,6 @@ class TrainManager:
 
                 # validate on the entire dev set
                 if self.steps % self.validation_freq == 0 and update:
-
                     valid_start_time = time.time()
 
                     valid_score, valid_loss, valid_references, valid_hypotheses, \
@@ -351,6 +372,16 @@ class TrainManager:
 
                     new_best = False
                     self.best = False
+                    
+                    # Learning rate protection during validation scheduler step
+                    if self.scheduler is not None and self.scheduler_step_at == "validation":
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        if current_lr > MIN_LR:
+                            self.scheduler.step(ckpt_score)
+                        else:
+                            self.logger.info(f"Learning rate {current_lr} below threshold {MIN_LR}, using cyclic schedule")
+                            self.cyclic_scheduler.step()
+
                     if self.is_best(ckpt_score):
                         self.best = True
                         self.best_ckpt_score = ckpt_score
@@ -363,23 +394,7 @@ class TrainManager:
                             new_best = True
                             self._save_checkpoint(type="best")
 
-                        # Display these sequences, in this index order
-                        display = list(range(0, len(valid_hypotheses), int(np.ceil(len(valid_hypotheses) / 13.15))))
-                        self.produce_validation_video(
-                            output_joints=valid_hypotheses,
-                            inputs=valid_inputs,
-                            references=valid_references,
-                            model_dir=self.model_dir,
-                            steps=self.steps,
-                            display=display,
-                            type="val_inf",
-                            file_paths=valid_file_paths,
-                        )
-
                     self._save_checkpoint(type="every")
-
-                    if self.scheduler is not None and self.scheduler_step_at == "validation":
-                        self.scheduler.step(ckpt_score)
 
                     # append to validation report
                     self._add_report(
@@ -396,12 +411,12 @@ class TrainManager:
                             valid_loss, valid_duration)
 
                 if self.stop:
-                    break
+                    continue
             if self.stop:
                 self.logger.info(
                     'Training ended since minimum lr %f was reached.',
                      self.learning_rate_min)
-                break
+                continue
 
             self.logger.info('Epoch %3d: total training loss %.5f', epoch_no+1,
                              epoch_loss)
@@ -412,7 +427,7 @@ class TrainManager:
                          self.early_stopping_metric)
 
         self.tb_writer.close()  # close Tensorboard writer
-
+        
     # Produce the video of Phoenix MTC joints
     def produce_validation_video(self,output_joints, inputs, references, display, model_dir, type, steps="", file_paths=None):
 
@@ -545,6 +560,10 @@ def train(cfg_file: str, ckpt=None) -> None:
     # Load the data - Trg as (batch, # of frames, joints + 1 )
     train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(cfg=cfg)
 
+    print("\nFirst 10 items in src_vocab:")
+    for idx, item in enumerate(src_vocab.itos[:10]):
+        print(f"{idx}: {item}")
+    print("Total src_vocab size:", len(src_vocab))
     # Build the Progressive Transformer model
     model = build_model(cfg, src_vocab=src_vocab, trg_vocab=trg_vocab)
 
